@@ -183,16 +183,64 @@ def parse_master_m3u8(master_content: str, master_url: str) -> dict:
     return streams
 
 
+def rewrite_m3u8_playlist(content: str, playlist_url: str, proxy_base: str) -> str:
+    """
+    Rewrites any M3U8 playlist (master or variant) so that all child resources
+    (AES keys, media audio tracks, variant playlists, and .ts segment chunks)
+    are routed through the CORS reverse proxy.
+    """
+    base_folder = playlist_url.rsplit("/", 1)[0] + "/"
+    out_lines = []
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # 1. Decryption Keys (#EXT-X-KEY)
+        if stripped.startswith("#EXT-X-KEY"):
+            def repl_key(m):
+                key_uri = m.group(1)
+                abs_key = key_uri if key_uri.startswith("http") else urllib.parse.urljoin(base_folder, key_uri)
+                proxied_key = f"{proxy_base}?url={urllib.parse.quote(abs_key, safe='')}"
+                return f'URI="{proxied_key}"'
+            line = re.sub(r'URI="([^"]+)"', repl_key, line)
+            out_lines.append(line)
+            continue
+
+        # 2. Audio & Subtitle Media Tracks (#EXT-X-MEDIA)
+        if stripped.startswith("#EXT-X-MEDIA"):
+            def repl_media(m):
+                media_uri = m.group(1)
+                abs_media = media_uri if media_uri.startswith("http") else urllib.parse.urljoin(base_folder, media_uri)
+                proxied_media = f"{proxy_base}?url={urllib.parse.quote(abs_media, safe='')}"
+                return f'URI="{proxied_media}"'
+            line = re.sub(r'URI="([^"]+)"', repl_media, line)
+            out_lines.append(line)
+            continue
+
+        # 3. Other M3U8 tags (#EXT...)
+        if stripped.startswith("#"):
+            out_lines.append(line)
+            continue
+
+        # 4. Stream URIs & .ts Segment files
+        abs_seg = stripped if stripped.startswith("http") else urllib.parse.urljoin(base_folder, stripped)
+        proxied_seg = f"{proxy_base}?url={urllib.parse.quote(abs_seg, safe='')}"
+        out_lines.append(proxied_seg)
+
+    return "\n".join(out_lines)
+
+
 def patch_master_m3u8(master_content: str, master_url: str, default_audio: str = "en", proxy_base: str = "") -> str:
     """
     Patches master.m3u8 content so that:
-    1. Relative URLs become absolute (or proxied).
-    2. The selected audio language (default: 'en' for English Dub) has DEFAULT=YES & AUTOSELECT=YES.
-    3. Non-selected audio tracks have DEFAULT=NO & AUTOSELECT=NO.
+    1. The selected audio language (default: 'en' for English Dub) has DEFAULT=YES & AUTOSELECT=YES.
+    2. Non-selected audio tracks have DEFAULT=NO & AUTOSELECT=NO.
+    3. All child variant playlists, audio tracks, and segments route through the reverse proxy.
     """
-    base_folder = master_url.rsplit("/", 1)[0] + "/"
-    out_lines = []
     target_lang = default_audio.lower().strip()
+    lines_with_defaults = []
 
     for line in master_content.splitlines():
         stripped = line.strip()
@@ -212,11 +260,10 @@ def patch_master_m3u8(master_content: str, master_url: str, default_audio: str =
             elif target_lang in ("ja", "jp", "japanese", "sub", "jpn"):
                 is_target = lang in ("ja", "jp", "jpn") or "japanese" in name or "sub" in name
             elif target_lang in ("all", "both"):
-                is_target = lang in ("en", "eng")  # default to English if both requested
+                is_target = lang in ("en", "eng")
 
             def_val = "YES" if is_target else "NO"
 
-            # Update or insert DEFAULT and AUTOSELECT attributes
             if "DEFAULT=" in line:
                 line = re.sub(r'DEFAULT=(YES|NO)', f'DEFAULT={def_val}', line, flags=re.IGNORECASE)
             else:
@@ -227,28 +274,12 @@ def patch_master_m3u8(master_content: str, master_url: str, default_audio: str =
             else:
                 line += f',AUTOSELECT={def_val}'
 
-            # Make URI absolute or proxied
-            uri_match = re.search(r'URI="?([^",\s]+)"?', line)
-            if uri_match:
-                rel_uri = uri_match.group(1)
-                abs_uri = rel_uri if rel_uri.startswith("http") else base_folder + rel_uri
-                if proxy_base:
-                    abs_uri = f"{proxy_base}?url={urllib.parse.quote(abs_uri, safe='')}"
-                line = line.replace(f'URI="{rel_uri}"', f'URI="{abs_uri}"')
+        lines_with_defaults.append(line)
 
-        elif stripped.startswith("#"):
-            out_lines.append(line)
-            continue
-        else:
-            # Video stream playlist file
-            abs_url = stripped if stripped.startswith("http") else base_folder + stripped
-            if proxy_base:
-                abs_url = f"{proxy_base}?url={urllib.parse.quote(abs_url, safe='')}"
-            line = abs_url
-
-        out_lines.append(line)
-
-    return "\n".join(out_lines)
+    content_with_defaults = "\n".join(lines_with_defaults)
+    if proxy_base:
+        return rewrite_m3u8_playlist(content_with_defaults, master_url, proxy_base)
+    return content_with_defaults
 
 
 # ─────────────────────────────────────────────────────────────
@@ -458,17 +489,27 @@ async def api_search(q: str = Query(..., min_length=1)):
 
 
 @app.get("/playlist/{uuid}/master.m3u8")
+@app.options("/playlist/{uuid}/master.m3u8")
 async def dynamic_master_playlist(
     request: Request,
     uuid: str,
-    audio: str = Query("en", description="Default audio track: 'en' for English Dub, 'ja' for Japanese Sub"),
-    proxy: Optional[bool] = Query(False, description="Set true to proxy all video/audio segment calls")
+    audio: str = Query("en", description="Default audio track: 'en' for English Dub, 'ja' for Japanese Sub")
 ):
     """
     Dynamically serves an RFC 8216 compliant HLS Master Playlist with English Dub (or Japanese Sub)
-    configured as DEFAULT=YES and AUTOSELECT=YES, with absolute CDN / Proxy URLs.
-    Compatible with Hls.js, MPV, VLC, ExoPlayer, iOS Safari, Kodi, Roku.
+    configured as DEFAULT=YES and AUTOSELECT=YES, with all child variant playlists, audio tracks,
+    AES keys, and TS segments automatically routed through the reverse proxy with 100% CORS support.
     """
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
     clean_uuid = extract_uuid(uuid)
     if not clean_uuid:
         raise HTTPException(status_code=400, detail="Invalid video UUID format")
@@ -479,7 +520,8 @@ async def dynamic_master_playlist(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch upstream master playlist: {e}")
 
-    proxy_base = f"{str(request.base_url).rstrip('/')}/proxy" if proxy else ""
+    base_host = str(request.base_url).rstrip("/")
+    proxy_base = f"{base_host}/proxy"
     patched = patch_master_m3u8(raw_master, master_url, default_audio=audio, proxy_base=proxy_base)
 
     return Response(
@@ -487,7 +529,8 @@ async def dynamic_master_playlist(
         media_type="application/vnd.apple.mpegurl",
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
             "Cache-Control": "public, max-age=3600",
             "Content-Disposition": f'inline; filename="{clean_uuid}_{audio}_master.m3u8"'
         }
@@ -495,8 +538,20 @@ async def dynamic_master_playlist(
 
 
 @app.get("/proxy")
-async def proxy_stream(url: str = Query(...)):
-    """Universal CORS streaming proxy with proper Referer spoofing."""
+@app.head("/proxy")
+@app.options("/proxy")
+async def proxy_stream(request: Request, url: str = Query("")):
+    """Universal CORS streaming proxy with proper Referer spoofing and recursive M3U8 rewriting."""
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
     if not url:
         raise HTTPException(status_code=400, detail="Missing url parameter")
 
@@ -507,11 +562,32 @@ async def proxy_stream(url: str = Query(...)):
     }
 
     try:
-        upstream = SESSION.get(url, headers=headers, timeout=20, stream=True)
+        upstream = SESSION.get(url, headers=headers, timeout=25, stream=True)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Proxy connection failed: {e}")
 
     content_type = upstream.headers.get("Content-Type", "application/octet-stream")
+    is_m3u8 = (
+        "mpegurl" in content_type.lower()
+        or url.split("?")[0].lower().endswith(".m3u8")
+    )
+
+    if is_m3u8:
+        raw_text = upstream.content.decode("utf-8", errors="replace")
+        base_host = str(request.base_url).rstrip("/")
+        proxy_base = f"{base_host}/proxy"
+        rewritten_m3u8 = rewrite_m3u8_playlist(raw_text, url, proxy_base)
+        return Response(
+            content=rewritten_m3u8,
+            status_code=upstream.status_code,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Cache-Control": "public, max-age=3600",
+            }
+        )
 
     def stream_chunks():
         for chunk in upstream.iter_content(chunk_size=65536):
@@ -524,7 +600,8 @@ async def proxy_stream(url: str = Query(...)):
         media_type=content_type,
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
             "Cache-Control": "public, max-age=86400"
         }
     )
